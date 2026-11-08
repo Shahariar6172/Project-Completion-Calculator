@@ -5,7 +5,7 @@ ID:IT-24057
  
 ## Objective
  
-Develop a web-based Project Completion Calculator for the ICT Lab Resource Booking System project using Java Servlet, JSP, manual JDBC and Apache Tomcat. The application calculates the total days between a start date and an end date (or the end date from a number of days), shows the duration on a timeline chart, and saves each project in a MySQL database.
+Develop a web-based Project Completion Calculator for the ICT Lab Resource Booking System project using Java Servlet, JSP, manual JDBC and Apache Tomcat. The application calculates the total days between a start date and an end date (or the end date from a number of days), shows the duration on a timeline chart, saves each project in a MySQL database, and lets the user add tasks to a project, mark them done and see the progress percentage.
  
 ## Technologies Used
  
@@ -16,7 +16,7 @@ Develop a web-based Project Completion Calculator for the ICT Lab Resource Booki
 | Jakarta Servlet API | HTTP request and response handling |
 | JSP | Displaying pages (view) |
 | JDBC (DriverManager, PreparedStatement) | Database access without any framework |
-| MySQL | 8.4 (Laragon) – stores saved projects |
+| MySQL | 8.4 (Laragon) – stores saved projects and their tasks |
 | Maven | Building the WAR file |
 | Chart.js | Timeline chart (loaded from CDN) |
 | HTML, CSS and JavaScript | User interface, styling and chart |
@@ -34,7 +34,10 @@ No Spring Boot, Spring MVC, Spring REST, Hibernate or JPA is used.
 - **Task 2 – Chart:** horizontal timeline bar with Chart.js on a 1-month axis. If the chart cannot render, the text summary is shown instead.
 - **Task 3 – Database:** a Save button stores project name, start date, end date and total days in MySQL using manual JDBC.
 - A Saved Projects page lists all saved projects with a timeline of all of them.
-- Handles invalid input (empty name, End Date before Start Date, wrong number of days).
+- **Task 4 – Tasks and progress:** each saved project has its own page where the user can add tasks and mark them done (or undo).
+- Shows progress as `done tasks / all tasks × 100`, e.g. `3 of 4 tasks done = 75% complete`, with a progress bar.
+- The Saved Projects page shows each project's progress, e.g. `75% (3/4)`, and each project name opens its task page.
+- Handles invalid input (empty name, End Date before Start Date, wrong number of days, empty task title).
 - Uses `PreparedStatement` (no SQL injection) and try-with-resources (connections always closed).
 - User input is HTML-escaped before being displayed.
  
@@ -50,6 +53,18 @@ Database: `project_calc`, Table: `projects`
 | `end_date` | DATE | End date |
 | `total_days` | INT | Total days (start and end included) |
 | `created_at` | DATETIME | Time of saving |
+ 
+Table: `tasks` (one project has many tasks)
+ 
+| Column | Type | Description |
+| --- | --- | --- |
+| `id` | INT, AUTO_INCREMENT, PRIMARY KEY | Row number |
+| `project_id` | INT, FOREIGN KEY → `projects.id` (ON DELETE CASCADE) | Project of this task |
+| `title` | VARCHAR(200) | Task title |
+| `done` | BOOLEAN | `0` = not done, `1` = done |
+| `created_at` | DATETIME | Time of adding |
+ 
+**Progress formula:** `progress % = done tasks × 100 / total tasks` (0% when there are no tasks). The counts come from one SQL query with `LEFT JOIN tasks`, `COUNT(t.id)` and `SUM(CASE WHEN t.done THEN 1 ELSE 0 END)`, grouped by project.
  
 ## Source Code
  
@@ -83,6 +98,18 @@ CREATE TABLE IF NOT EXISTS projects (
 INSERT INTO projects (project_name, start_date, end_date, total_days)
 SELECT 'ICT Lab Resource Booking System', '2026-10-24', '2026-10-28', 5
 WHERE NOT EXISTS (SELECT 1 FROM projects);
+ 
+-- 4. Tasks of each project. One project has many tasks.
+--    done = 0 (not done) or 1 (done).
+--    ON DELETE CASCADE: if a project is deleted, its tasks are deleted too.
+CREATE TABLE IF NOT EXISTS tasks (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    project_id INT NOT NULL,
+    title      VARCHAR(200) NOT NULL,
+    done       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
 ```
  
 ### db.properties
@@ -203,6 +230,59 @@ public class Project {
         return name + ": " + getStartText() + " to " + getEndText()
                 + " = " + totalDays + (totalDays == 1 ? " day" : " days");
     }
+ 
+    // ---------- Task progress ----------
+    // How many tasks this project has, and how many of them are done.
+    // ProjectDao fills these with COUNT(...) from the "tasks" table.
+    private int taskTotal;
+    private int taskDone;
+ 
+    public int getTaskTotal()       { return taskTotal; }
+    public int getTaskDone()        { return taskDone; }
+ 
+    public void setTaskCounts(int total, int done) {
+        this.taskTotal = total;
+        this.taskDone = done;
+    }
+ 
+    /** Progress in percent: done / total * 100, e.g. 3 of 4 tasks = 75. No tasks = 0. */
+    public int getProgress() {
+        if (taskTotal == 0) {
+            return 0;
+        }
+        return Math.round(taskDone * 100f / taskTotal);
+    }
+}
+```
+ 
+### Task.java
+ 
+`src/main/java/com/projectcalc/model/Task.java`
+ 
+```java
+package com.projectcalc.model;
+ 
+/**
+ * One task of a project (one row of the "tasks" table).
+ */
+public class Task {
+ 
+    private int id;
+    private int projectId;      // which project this task belongs to
+    private String title;
+    private boolean done;       // true = task is completed
+ 
+    public Task(int id, int projectId, String title, boolean done) {
+        this.id = id;
+        this.projectId = projectId;
+        this.title = title;
+        this.done = done;
+    }
+ 
+    public int getId()          { return id; }
+    public int getProjectId()   { return projectId; }
+    public String getTitle()    { return title; }
+    public boolean isDone()     { return done; }
 }
 ```
  
@@ -384,10 +464,21 @@ public class ProjectDao {
         }
     }
  
-    /** Returns all saved projects, newest first. */
+    // Columns of a project + its task counts.
+    // LEFT JOIN keeps projects that have no tasks yet (their counts are 0).
+    // GROUP BY p.id makes one result row per project.
+    private static final String SELECT_WITH_PROGRESS =
+            "SELECT p.id, p.project_name, p.start_date, p.end_date, p.total_days, "
+          + "       COUNT(t.id) AS task_total, "
+          + "       SUM(CASE WHEN t.done THEN 1 ELSE 0 END) AS task_done "
+          + "FROM projects p LEFT JOIN tasks t ON t.project_id = p.id ";
+ 
+    private static final String GROUP_BY =
+            " GROUP BY p.id, p.project_name, p.start_date, p.end_date, p.total_days";
+ 
+    /** Returns all saved projects (with task progress), newest first. */
     public List<Project> findAll() throws SQLException {
-        String sql = "SELECT id, project_name, start_date, end_date, total_days "
-                   + "FROM projects ORDER BY id DESC";
+        String sql = SELECT_WITH_PROGRESS + GROUP_BY + " ORDER BY p.id DESC";
         List<Project> list = new ArrayList<>();
  
         try (Connection con = DBConnection.getConnection();
@@ -396,15 +487,114 @@ public class ProjectDao {
  
             // Each row of the result becomes one Project object.
             while (rs.next()) {
-                list.add(new Project(
-                        rs.getInt("id"),
-                        rs.getString("project_name"),
-                        rs.getDate("start_date").toLocalDate(),   // java.sql.Date -> LocalDate
-                        rs.getDate("end_date").toLocalDate(),
-                        rs.getInt("total_days")));
+                list.add(readProject(rs));
             }
         }
         return list;
+    }
+ 
+    /** Returns one project (with task progress), or null if the id does not exist. */
+    public Project findById(int id) throws SQLException {
+        String sql = SELECT_WITH_PROGRESS + "WHERE p.id = ?" + GROUP_BY;
+ 
+        try (Connection con = DBConnection.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+ 
+            ps.setInt(1, id);
+ 
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? readProject(rs) : null;
+            }
+        }
+    }
+ 
+    // Turns the current result row into a Project object.
+    private Project readProject(ResultSet rs) throws SQLException {
+        Project p = new Project(
+                rs.getInt("id"),
+                rs.getString("project_name"),
+                rs.getDate("start_date").toLocalDate(),   // java.sql.Date -> LocalDate
+                rs.getDate("end_date").toLocalDate(),
+                rs.getInt("total_days"));
+        p.setTaskCounts(rs.getInt("task_total"), rs.getInt("task_done"));
+        return p;
+    }
+}
+```
+ 
+### TaskDao.java
+ 
+`src/main/java/com/projectcalc/dao/TaskDao.java`
+ 
+```java
+package com.projectcalc.dao;
+ 
+import com.projectcalc.db.DBConnection;
+import com.projectcalc.model.Task;
+ 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+ 
+/**
+ * All SQL for the "tasks" table.
+ * Same style as ProjectDao: PreparedStatement + try-with-resources.
+ */
+public class TaskDao {
+ 
+    /** All tasks of one project, in the order they were added. */
+    public List<Task> findByProject(int projectId) throws SQLException {
+        String sql = "SELECT id, project_id, title, done FROM tasks WHERE project_id = ? ORDER BY id";
+        List<Task> list = new ArrayList<>();
+ 
+        try (Connection con = DBConnection.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+ 
+            ps.setInt(1, projectId);
+ 
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    list.add(new Task(
+                            rs.getInt("id"),
+                            rs.getInt("project_id"),
+                            rs.getString("title"),
+                            rs.getBoolean("done")));
+                }
+            }
+        }
+        return list;
+    }
+ 
+    /** Adds a new task (not done yet) to a project. */
+    public void add(int projectId, String title) throws SQLException {
+        String sql = "INSERT INTO tasks (project_id, title, done) VALUES (?, ?, FALSE)";
+ 
+        try (Connection con = DBConnection.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+ 
+            ps.setInt(1, projectId);
+            ps.setString(2, title);
+            ps.executeUpdate();
+        }
+    }
+ 
+    /**
+     * Marks a task done, or not done again (done = NOT done).
+     * "AND project_id = ?" makes sure the task really belongs to this project.
+     */
+    public void toggle(int taskId, int projectId) throws SQLException {
+        String sql = "UPDATE tasks SET done = NOT done WHERE id = ? AND project_id = ?";
+ 
+        try (Connection con = DBConnection.getConnection();
+             PreparedStatement ps = con.prepareStatement(sql)) {
+ 
+            ps.setInt(1, taskId);
+            ps.setInt(2, projectId);
+            ps.executeUpdate();
+        }
     }
 }
 ```
@@ -529,16 +719,18 @@ public class SaveServlet extends HttpServlet {
             return;
         }
  
+        int newId;
         try {
-            dao.save(p);
+            newId = dao.save(p);
         } catch (SQLException e) {
             // ServletException makes Tomcat show an error page and write the cause to its log.
             throw new ServletException("Could not save the project. Is MySQL running?", e);
         }
  
-        // Redirect (not forward): if the user presses F5 on the list page,
+        // Go to the new project's page, where the user can add tasks.
+        // Redirect (not forward): if the user presses F5 there,
         // the browser does not send the Save form again (no duplicate rows).
-        resp.sendRedirect(req.getContextPath() + "/projects?saved=1");
+        resp.sendRedirect(req.getContextPath() + "/project?id=" + newId + "&saved=1");
     }
 }
 ```
@@ -581,6 +773,114 @@ public class ProjectListServlet extends HttpServlet {
         // "saved=1" is added by SaveServlet, so the page can show "Project saved."
         req.setAttribute("saved", "1".equals(req.getParameter("saved")));
         req.getRequestDispatcher("/WEB-INF/views/projects.jsp").forward(req, resp);
+    }
+}
+```
+ 
+### ProjectDetailServlet.java
+ 
+`src/main/java/com/projectcalc/servlet/ProjectDetailServlet.java`
+ 
+```java
+package com.projectcalc.servlet;
+ 
+import com.projectcalc.dao.ProjectDao;
+import com.projectcalc.dao.TaskDao;
+import com.projectcalc.model.Project;
+ 
+import jakarta.servlet.ServletException;
+import jakarta.servlet.annotation.WebServlet;
+import jakarta.servlet.http.HttpServlet;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+ 
+import java.io.IOException;
+import java.sql.SQLException;
+ 
+/**
+ * One project's page: its tasks, the add-task form and the progress bar.
+ *
+ * GET  /project?id=5                          -> show project 5 and its tasks
+ * POST /project  (action=add,    id, title)   -> add a task
+ * POST /project  (action=toggle, id, taskId)  -> mark a task done / not done
+ */
+@WebServlet("/project")
+public class ProjectDetailServlet extends HttpServlet {
+ 
+    private final ProjectDao projectDao = new ProjectDao();
+    private final TaskDao taskDao = new TaskDao();
+ 
+    @Override
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        int id = readInt(req.getParameter("id"));
+ 
+        try {
+            Project project = projectDao.findById(id);
+            if (project == null) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND, "Project not found.");
+                return;
+            }
+            req.setAttribute("project", project);
+            req.setAttribute("tasks", taskDao.findByProject(id));
+        } catch (SQLException e) {
+            throw new ServletException("Could not load the project. Is MySQL running?", e);
+        }
+ 
+        // Messages after a redirect: saved=1 (from SaveServlet), error=title (empty task title)
+        req.setAttribute("saved", "1".equals(req.getParameter("saved")));
+        req.setAttribute("titleError", "title".equals(req.getParameter("error")));
+        req.getRequestDispatcher("/WEB-INF/views/project.jsp").forward(req, resp);
+    }
+ 
+    @Override
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        req.setCharacterEncoding("UTF-8");
+ 
+        int projectId = readInt(req.getParameter("id"));
+        String action = req.getParameter("action");
+        String back = req.getContextPath() + "/project?id=" + projectId;
+ 
+        try {
+            if (projectDao.findById(projectId) == null) {
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND, "Project not found.");
+                return;
+            }
+ 
+            if ("add".equals(action)) {
+                String title = req.getParameter("title");
+                title = (title == null) ? "" : title.trim();
+ 
+                // Server-side check: title must not be empty or too long.
+                if (title.isEmpty() || title.length() > 200) {
+                    resp.sendRedirect(back + "&error=title");
+                    return;
+                }
+                taskDao.add(projectId, title);
+ 
+            } else if ("toggle".equals(action)) {
+                taskDao.toggle(readInt(req.getParameter("taskId")), projectId);
+ 
+            } else {
+                resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "Unknown action.");
+                return;
+            }
+        } catch (SQLException e) {
+            throw new ServletException("Could not update tasks. Is MySQL running?", e);
+        }
+ 
+        // Back to the same page (POST -> Redirect -> GET, so F5 does not repeat the action).
+        resp.sendRedirect(back);
+    }
+ 
+    // Converts a text id to a number. A wrong value becomes 0, which no row has (-> "not found").
+    private int readInt(String text) {
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 }
 ```
@@ -750,7 +1050,7 @@ public class ProjectListServlet extends HttpServlet {
         <%-- The table. Each row also carries data-* values that the chart script reads. --%>
         <table class="card">
             <thead>
-            <tr><th>#</th><th>Project Name</th><th>Start Date</th><th>End Date</th><th>Total Days</th></tr>
+            <tr><th>#</th><th>Project Name</th><th>Start Date</th><th>End Date</th><th>Total Days</th><th>Progress</th></tr>
             </thead>
             <tbody>
             <% for (Project p : projects) { %>
@@ -761,10 +1061,16 @@ public class ProjectListServlet extends HttpServlet {
                     data-days="<%= p.getTotalDays() %>"
                     data-summary="<%= Html.escape(p.getSummary()) %>">
                     <td><%= p.getId() %></td>
-                    <td><%= Html.escape(p.getName()) %></td>
+                    <%-- Click the name to open the project's tasks --%>
+                    <td><a href="<%= ctx %>/project?id=<%= p.getId() %>"><%= Html.escape(p.getName()) %></a></td>
                     <td><%= p.getStartText() %></td>
                     <td><%= p.getEndText() %></td>
                     <td><%= p.getTotalDays() %></td>
+                    <%-- Task progress, e.g. "75% (3/4)" with a small bar --%>
+                    <td>
+                        <div class="progress small"><div class="progress-fill" style="width: <%= p.getProgress() %>%"></div></div>
+                        <%= p.getProgress() %>% (<%= p.getTaskDone() %>/<%= p.getTaskTotal() %>)
+                    </td>
                 </tr>
             <% } %>
             </tbody>
@@ -792,6 +1098,107 @@ public class ProjectListServlet extends HttpServlet {
         drawTimeline(canvas, items);
     }
 </script>
+</body>
+</html>
+```
+ 
+### project.jsp
+ 
+`src/main/webapp/WEB-INF/views/project.jsp`
+ 
+```jsp
+<%@ page contentType="text/html; charset=UTF-8" pageEncoding="UTF-8" %>
+<%@ page import="java.util.List, com.projectcalc.model.Project, com.projectcalc.model.Task, com.projectcalc.util.Html" %>
+<%
+    // Values put into the request by ProjectDetailServlet.
+    String ctx = request.getContextPath();
+    Project project = (Project) request.getAttribute("project");
+    @SuppressWarnings("unchecked")
+    List<Task> tasks = (List<Task>) request.getAttribute("tasks");
+    boolean saved = Boolean.TRUE.equals(request.getAttribute("saved"));
+    boolean titleError = Boolean.TRUE.equals(request.getAttribute("titleError"));
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><%= Html.escape(project.getName()) %> - Tasks</title>
+    <link rel="stylesheet" href="<%= ctx %>/css/style.css">
+</head>
+<body>
+<main class="container">
+ 
+    <nav>
+        <a href="<%= ctx %>/calculate">Calculator</a>
+        <a href="<%= ctx %>/projects">Saved Projects</a>
+    </nav>
+ 
+    <h1><%= Html.escape(project.getName()) %></h1>
+    <p class="hint"><%= project.getStartText() %> to <%= project.getEndText() %>
+        = <%= project.getTotalDays() %> <%= project.getTotalDays() == 1 ? "day" : "days" %></p>
+ 
+    <% if (saved) { %>
+        <p class="success" role="status">Project saved. Now add its tasks.</p>
+    <% } %>
+ 
+    <%-- ===== Progress: done tasks / all tasks ===== --%>
+    <section class="card">
+        <h2>Progress</h2>
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="<%= project.getProgress() %>">
+            <div class="progress-fill" style="width: <%= project.getProgress() %>%"></div>
+        </div>
+        <p class="summary">
+            <%= project.getTaskDone() %> of <%= project.getTaskTotal() %> tasks done
+            = <%= project.getProgress() %>% complete
+        </p>
+    </section>
+ 
+    <%-- ===== Task list ===== --%>
+    <section class="card">
+        <h2>Tasks</h2>
+ 
+        <% if (tasks.isEmpty()) { %>
+            <p class="hint">No tasks yet. Add the first task below.</p>
+        <% } else { %>
+            <ul class="task-list">
+            <% for (Task t : tasks) { %>
+                <li class="<%= t.isDone() ? "done" : "" %>">
+                    <span class="task-title"><%= Html.escape(t.getTitle()) %></span>
+ 
+                    <%-- Each task has a small form: clicking the button marks it done (or undo). --%>
+                    <form method="post" action="<%= ctx %>/project">
+                        <input type="hidden" name="action" value="toggle">
+                        <input type="hidden" name="id" value="<%= project.getId() %>">
+                        <input type="hidden" name="taskId" value="<%= t.getId() %>">
+                        <button type="submit" class="<%= t.isDone() ? "btn-light" : "" %>">
+                            <%= t.isDone() ? "Undo" : "Mark done" %>
+                        </button>
+                    </form>
+                </li>
+            <% } %>
+            </ul>
+        <% } %>
+ 
+        <%-- Add task form --%>
+        <form method="post" action="<%= ctx %>/project" class="add-task">
+            <input type="hidden" name="action" value="add">
+            <input type="hidden" name="id" value="<%= project.getId() %>">
+            <label for="title">New task</label>
+            <div class="row">
+                <input id="title" name="title" type="text" maxlength="200" required
+                       placeholder="e.g. Design database">
+                <button type="submit">Add Task</button>
+            </div>
+        </form>
+ 
+        <% if (titleError) { %>
+            <p class="error" role="alert">Task title is required (max 200 characters).</p>
+        <% } %>
+    </section>
+ 
+</main>
 </body>
 </html>
 ```
@@ -952,6 +1359,22 @@ button:hover { background: #1f58b3; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 8px; border-bottom: 1px solid #ddd; text-align: left; }
 th { background: #f0f3f8; }
+ 
+/* ---------- Tasks and progress ---------- */
+.progress { height: 18px; background: #e3e8f0; border-radius: 9px; overflow: hidden; }
+.progress.small { height: 8px; width: 90px; margin-bottom: 4px; }
+.progress-fill { height: 100%; background: #22a35a; }
+ 
+.task-list { list-style: none; padding: 0; margin: 0 0 8px; }
+.task-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+                padding: 8px 0; border-bottom: 1px solid #eee; }
+.task-list li.done .task-title { text-decoration: line-through; color: #888; }
+.task-list button { margin-top: 0; padding: 6px 12px; font-size: 14px; }
+.btn-light { background: #e3e8f0; color: #333; }
+.btn-light:hover { background: #cfd6e2; }
+ 
+.add-task .row { align-items: center; }
+.add-task .row button { margin-top: 0; flex: 0 0 auto; }
 ```
  
 ### index.jsp
@@ -1057,7 +1480,7 @@ Open Laragon and click **Start All** to start MySQL.
  
 ### 2. Create the Database
  
-Open the VS Code PowerShell terminal and run (only once):
+Open the VS Code PowerShell terminal and run it once. Run it again after adding the task feature, to create the `tasks` table (existing data is kept):
  
 ```powershell
 Get-Content db\schema.sql | & (Get-ChildItem C:\laragon\bin\mysql\*\bin\mysql.exe | Select-Object -First 1).FullName -u root
@@ -1087,7 +1510,7 @@ Keep the terminal open while using the application. Press **Ctrl + C** to stop T
  
 Visit [http://localhost:8080/project-calculator/](http://localhost:8080/project-calculator/).
  
-Enter a project name and dates (or number of days), click **Calculate**, then click **Save**. Saved projects are shown at [http://localhost:8080/project-calculator/projects](http://localhost:8080/project-calculator/projects) and in HeidiSQL (Laragon → Database → `project_calc` → `projects` → Data).
+Enter a project name and dates (or number of days), click **Calculate**, then click **Save**. The project page opens: type a task and click **Add Task**, then click **Mark done** on finished tasks to see the progress. Saved projects are shown at [http://localhost:8080/project-calculator/projects](http://localhost:8080/project-calculator/projects) and in HeidiSQL (Laragon → Database → `project_calc` → `projects` → Data).
  
 ## Working Procedure
  
@@ -1100,19 +1523,25 @@ Enter a project name and dates (or number of days), click **Calculate**, then cl
 7. `timeline.js` draws the Chart.js timeline; if Chart.js is not loaded, it shows the text summary instead.
 8. The Save button sends the result to `SaveServlet`, which calculates again and calls `ProjectDao.save()`.
 9. `ProjectDao.save()` opens a connection with `DBConnection.getConnection()` and runs an `INSERT` with `PreparedStatement` inside try-with-resources.
-10. `SaveServlet` redirects to `/projects`; `ProjectListServlet` calls `ProjectDao.findAll()` and `projects.jsp` shows the table and chart.
+10. `SaveServlet` redirects to `/project?id=…`, the new project's page.
+11. `ProjectDetailServlet.doGet()` loads the project with `ProjectDao.findById()` (which also counts total and done tasks) and its tasks with `TaskDao.findByProject()`. `project.jsp` shows the task list, the progress bar and `X of Y tasks done = Z% complete`.
+12. **Add Task** posts `action=add` to `ProjectDetailServlet`, which checks the title and calls `TaskDao.add()`.
+13. **Mark done / Undo** posts `action=toggle`, and `TaskDao.toggle()` runs `UPDATE tasks SET done = NOT done`.
+14. After each action the servlet redirects back to the project page, so the progress is recalculated from the database.
+15. `ProjectListServlet` calls `ProjectDao.findAll()` and `projects.jsp` shows all projects with their progress and the timeline chart.
  
 ## Screenshots
  
 <img width="461" height="415" alt="Screenshot 2026-11-07 190853" src="https://github.com/user-attachments/assets/d1ca5f20-9edb-41ab-8d2c-a762c778a983" />
-
 <img width="441" height="417" alt="Screenshot 2026-11-07 190913" src="https://github.com/user-attachments/assets/af613e6f-5fb3-4cb8-b71e-c1bd31b25014" />
-
 <img width="436" height="406" alt="Screenshot 2026-11-07 190930" src="https://github.com/user-attachments/assets/e42c34b3-aa19-4bbd-9d32-dac4a041141e" />
-
 <img width="953" height="506" alt="Screenshot 2026-11-07 190940" src="https://github.com/user-attachments/assets/cc0b5fe3-7ee1-4f66-ad60-3ad2e8c7b6c9" />
+ 
+<img width="307" height="385" alt="Screenshot 2026-11-08 180902" src="https://github.com/user-attachments/assets/ae476312-ebf9-44f4-9fba-bd5e1147e08a" />
+
  
 ## Conclusion
  
-The application demonstrates form processing, request handling, date calculation, input validation, chart visualization and database storage using Java Servlet, JSP and manual JDBC on Apache Tomcat without any framework. `PreparedStatement` and try-with-resources keep database access safe and simple, and the text summary fallback keeps the result visible even when the chart cannot load.
+The application demonstrates form processing, request handling, date calculation, input validation, chart visualization, task tracking with progress percentage and database storage with two related tables using Java Servlet, JSP and manual JDBC on Apache Tomcat without any framework. `PreparedStatement` and try-with-resources keep database access safe and simple, and the text summary fallback keeps the result visible even when the chart cannot load.
+ 
  
